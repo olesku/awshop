@@ -1,0 +1,9 @@
+[package]
+name = "awshop-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Contracts and AWS command helpers for awshop plugins"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Present so awshop offers SSM; the fake aws never calls it.
+exit 0

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keeps the real host name out of the recording if a step goes wrong.
+echo demo-laptop

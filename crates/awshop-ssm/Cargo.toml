@@ -1,0 +1,10 @@
+[package]
+name = "awshop-ssm"
+version = "0.1.0"
+edition = "2021"
+description = "Systems Manager sessions on EC2 instances for awshop"
+license = "MIT"
+
+[dependencies]
+awshop-plugin = { path = "../awshop-plugin", version = "0.1.0" }
+serde_json = "1"
