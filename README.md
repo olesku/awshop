@@ -1,5 +1,10 @@
 <p align="center"><img src="docs/logo.svg" alt="awshop" width="645"></p>
 
+<p align="center">
+  <a href="https://github.com/olesku/awshop/actions/workflows/ci.yml"><img src="https://github.com/olesku/awshop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/olesku/awshop/releases/latest"><img src="https://img.shields.io/github/v/release/olesku/awshop" alt="Latest release"></a>
+</p>
+
 <p align="center"><img src="docs/demo.gif" alt="awshop: switch accounts with SSO login, open an EKS session and an SSM shell" width="800"></p>
 
 # awshop
