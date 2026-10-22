@@ -429,13 +429,14 @@ def test_export_flag_can_be_evaluated(f):
 def test_direct_terminal_run_prints_export_command(f):
     f.env['SHELL'] = SHELLS[CURRENT][0]
     s = Session(f, command=['/bin/sh', '-c', 'exec awshop --no-login prod >/dev/tty'])
-    s.wait('› prod')
+    s.wait('› prod', 'No shell integration, so Enter only prints the profile.')
     assert s.finish(b'\r') == ''
     output = ANSI.sub(b'', s.output).decode()
     assert 'export AWS_PROFILE=prod' in output
     hint = {'fish': 'awshop init fish | source to ~/.config/fish/config.fish'}.get(
         CURRENT, 'eval "$(awshop init '+CURRENT+')" to ~/.'+CURRENT+'rc')
-    assert hint in output
+    assert hint+' to switch automatically' in output
+    assert 'https://github.com/olesku/awshop#shell-integration' in output
 
 
 def test_prompt_segments(f):

@@ -40,8 +40,19 @@ pub fn run(mut config: AwsConfig, args: &[String], owner: Option<u32>) -> Result
   // With the shell function, Enter opens the profile's menu, which starts at using it
   // here. Without it, Enter uses the profile at once, so scripts get its name. Going
   // back from the menu returns to this list as it was left.
-  let menu_first = owner.is_some() && !args.iter().any(|arg| arg == "--export");
+  let export = args.iter().any(|arg| arg == "--export");
+  let menu_first = owner.is_some() && !export;
   let (mut selected, mut query) = (active.clone(), query);
+
+  // Run in a terminal without the shell function, say so before Enter skips the menu.
+  let description = if owner.is_none() && !export && io::stdout().is_terminal() {
+    format!(
+      "No shell integration, so Enter only prints the profile. For EKS, SSM and the console, {}.",
+      init::hint()
+    )
+  } else {
+    String::new()
+  };
 
   // Accounts the SSO portal added or removed show up while the list is open. The
   // list is rebuilt when the sync is done, also without changes, so an empty list
@@ -69,7 +80,7 @@ pub fn run(mut config: AwsConfig, args: &[String], owner: Option<u32>) -> Result
     };
     let picker = Picker {
       title: "AWS profile selector · * marks the active profile",
-      description: "",
+      description: &description,
       current: &active,
       selected: &selected,
       query: &query,
@@ -155,8 +166,12 @@ fn use_profile(name: &str, args: &[String], owner: Option<u32>) -> Vec<Op> {
 
   if interactive && !export {
     eprintln!(
-      "Tip: {} to switch automatically, or run: eval \"$(awshop --export)\"",
+      "Tip: {} to switch automatically and get the profile menu with EKS, SSM and the console.",
       init::hint()
+    );
+    eprintln!(
+      "Setup, Oh My Zsh and the prompt: {}#shell-integration",
+      env!("CARGO_PKG_REPOSITORY")
     );
   }
 
