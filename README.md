@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/logo.svg" alt="awshop" width="645"></p>
+<h1 align="center"><img src="docs/logo.svg" alt="awshop" width="645"></h1>
 
 <p align="center">
   <a href="https://github.com/olesku/awshop/actions/workflows/ci.yml"><img src="https://github.com/olesku/awshop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
@@ -6,8 +6,6 @@
 </p>
 
 <p align="center"><img src="docs/demo.gif" alt="awshop: switch accounts with SSO login, open an EKS session and an SSM shell" width="800"></p>
-
-# awshop
 
 A terminal UI for hopping between AWS accounts. Pick a profile and it is set in your shell, logged in with SSO when needed. Or go straight on to an EKS cluster or an EC2 instance in that account.
 
