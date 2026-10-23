@@ -2,7 +2,7 @@
 //! runs `aws ssm start-session` on the terminal.
 use awshop_plugin::{account, json, Account, Context, Dependency, Outcome, Plugin, Resource, Result, Settings, Setup};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{collections::HashMap, thread};
 
 /// Lists the EC2 instances that Systems Manager manages and opens a shell on one.
 pub struct Ssm;
@@ -18,6 +18,10 @@ impl Plugin for Ssm {
 
   fn description(&self) -> &'static str {
     "Open a shell on an EC2 instance through Systems Manager"
+  }
+
+  fn headings(&self) -> &'static [&'static str] {
+    &["Name", "Instance", "Platform", "IP address", "Agent"]
   }
 
   fn dependencies(&self) -> &'static [Dependency] {
@@ -36,42 +40,39 @@ impl Plugin for Ssm {
   }
 
   fn discover(&self, context: &Context) -> Result<Vec<Resource>> {
-    let Account { id: account, partition } = account(context)?;
-    let managed = json(
-      &mut context.aws("ssm", "describe-instance-information")?,
-      "Systems Manager instance discovery",
-    )?;
+    // The names come from EC2 while Systems Manager lists the instances.
+    let (managed, names) = thread::scope(|scope| {
+      let names = scope.spawn(|| names(context));
+      let managed = account(context).and_then(|account| {
+        let managed = json(
+          &mut context.aws("ssm", "describe-instance-information")?,
+          "Systems Manager instance discovery",
+        )?;
+        Ok((account, managed))
+      });
+      (managed, names.join().unwrap_or_default())
+    });
+    let (Account { id: account, partition }, managed) = managed?;
     let instances: Vec<&Value> = managed["InstanceInformationList"]
       .as_array()
       .ok_or("Systems Manager response did not contain an instance list.")?
       .iter()
       .filter(|instance| instance["ResourceType"] == "EC2Instance")
       .collect();
-    let ids: Vec<&str> = instances
-      .iter()
-      .filter_map(|instance| instance["InstanceId"].as_str())
-      .collect();
-
-    let names = names(context, &ids);
-
     let mut resources: Vec<_> = instances
       .iter()
       .filter_map(|instance| {
         let id = instance["InstanceId"].as_str()?;
-        let detail = [
+        let columns = [
           id,
           field(instance, "PlatformName"),
           field(instance, "IPAddress"),
           field(instance, "PingStatus"),
-        ]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ");
+        ];
         Some(Resource {
           id: format!("arn:{partition}:ec2:{}:{account}:instance/{id}", context.region),
           label: names.get(id).cloned().unwrap_or_else(|| id.to_owned()),
-          detail,
+          columns: columns.map(str::to_owned).to_vec(),
           current: false,
         })
       })
@@ -112,18 +113,14 @@ impl Plugin for Ssm {
   }
 }
 
-/// Name tags by instance ID. Names only decorate the list, so instances are still
+/// Name tags by instance ID, for all instances in the region, so the lookup needn't wait
+/// for the Systems Manager list. Names only decorate the list, so instances are still
 /// listed by ID when EC2 can't be read, for example without ec2:DescribeInstances.
-fn names(context: &Context, ids: &[&str]) -> HashMap<String, String> {
+fn names(context: &Context) -> HashMap<String, String> {
   let mut names = HashMap::new();
-  if ids.is_empty() {
-    return names;
-  }
-
   let Ok(mut command) = context.aws("ec2", "describe-instances") else {
     return names;
   };
-  command.arg("--instance-ids").args(ids);
   let Ok(described) = json(&mut command, "EC2 instance lookup") else {
     return names;
   };
@@ -165,11 +162,12 @@ mod tests {
       region: "eu-north-1".into(),
       executables: [("aws".into(), PathBuf::from("/test/aws"))].into(),
       original_environment: Default::default(),
+      account: None,
     };
     let resource = Resource {
       id: "arn:aws:ec2:eu-north-1:123456789012:instance/i-0abc".into(),
       label: "web-1".into(),
-      detail: String::new(),
+      columns: Vec::new(),
       current: false,
     };
 

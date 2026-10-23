@@ -11,7 +11,7 @@ awshop eks --profile dev --region eu-north-1 dev-1
 
 The plugin uses your active profile, or the profile whose menu you chose EKS in. Through the selector, a successful action also sets `AWS_PROFILE` to the profile it used. The region comes from `--region`, `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile, in that order. If none is set, it asks.
 
-1. **Pick a cluster.** The list shows each cluster's Kubernetes version, such as `v1.31`, and a status other than `ACTIVE`, such as `UPDATING`. `*` marks the cluster of kubectl's current context, across all files in `KUBECONFIG`, and the list starts there. Versions arrive a moment after the list; without `eks:DescribeCluster`, it shows none.
+1. **Pick a cluster.** The list has the columns **Cluster**, **Version**, such as `v1.31`, and **Status**, such as `ACTIVE` or `UPDATING`. `*` marks the cluster of kubectl's current context, across all files in `KUBECONFIG`, and the list starts there. Version and status arrive a moment after the list; without `eks:DescribeCluster`, neither column is shown. After the first time, the list from the last run shows at once while the fresh one loads; see [Cache](config.md#cache).
 2. **Review the setup.** It shows the profile, region, scope, authentication, context name, lookup role and, for Saved config, the kubeconfig file. The text below the menu explains the highlighted option.
 3. **Run the action.** Select **Start EKS session**, or **Configure and activate** / **Update and activate** for Saved config.
 

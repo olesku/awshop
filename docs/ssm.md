@@ -13,17 +13,21 @@ awshop                      # or pick a profile and choose SSM in its menu
 
 - **AWS CLI v2** and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) in `PATH`. Without the plugin, SSM shows as unavailable in the profile's menu.
 - **Instances:** the SSM Agent must run on the instance, and its instance profile must allow Systems Manager, for example with `AmazonSSMManagedInstanceCore`.
-- **Permissions:** `sts:GetCallerIdentity` to find the account, `ssm:DescribeInstanceInformation` to list instances and `ssm:StartSession` to connect. `ec2:DescribeInstances` adds the `Name` tags; without it, instances are listed by ID.
+- **Permissions:** `sts:GetCallerIdentity` to find the account, `ssm:DescribeInstanceInformation` to list instances and `ssm:StartSession` to connect. `ec2:DescribeInstances` adds the `Name` tags, read for the whole region at the same time as the instance list; without it, instances are listed by ID.
 
 ## The list
 
 | Column | Shows |
 | --- | --- |
 | Name | The instance's `Name` tag, or its ID |
-| Detail | Instance ID, platform, private IP and the agent status, such as `Online` or `ConnectionLost` |
+| Instance | The instance ID |
+| Platform | The operating system, such as `Amazon Linux` |
+| IP address | The private IP address |
+| Agent | The agent status, such as `Online` or `ConnectionLost` |
 
 - **Only EC2 instances:** hybrid nodes that Systems Manager manages (`mi-…`) are left out.
 - **Offline agents:** instances whose agent isn't `Online` are listed, but a session to them fails with the AWS CLI's error.
+- **The last list:** after the first time, the list from the last run shows at once while the fresh one loads, and a session waits for the fresh one. See [Cache](config.md#cache).
 
 ## The session
 

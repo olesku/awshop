@@ -5,11 +5,12 @@ use awshop_plugin::Result;
 use serde::Deserialize;
 use std::{collections::BTreeMap, env, fs, io, path::PathBuf};
 
-/// The whole file: `[sso]`, then one table per plugin, keyed by plugin name.
+/// The whole file: `[sso]`, `[selector]`, then one table per plugin, keyed by plugin name.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
   pub sso: SsoConfig,
+  pub selector: SelectorConfig,
   #[serde(flatten)]
   plugins: BTreeMap<String, PluginConfig>,
 }
@@ -28,14 +29,68 @@ impl Default for SsoConfig {
   }
 }
 
+/// Settings in the `[selector]` table.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelectorConfig {
+  /// The columns after the profile name, in order. The search matches them too.
+  pub details: Vec<Detail>,
+}
+
+impl Default for SelectorConfig {
+  fn default() -> Self {
+    Self {
+      details: vec![Detail::Login, Detail::Account, Detail::Role, Detail::Region],
+    }
+  }
+}
+
+/// A column in the profile list.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Detail {
+  /// How the profile logs in, such as with its SSO session.
+  Login,
+  /// The SSO account ID.
+  Account,
+  /// The SSO role name.
+  Role,
+  /// The profile's region.
+  Region,
+}
+
+impl Detail {
+  /// The column's heading.
+  pub fn heading(self) -> &'static str {
+    match self {
+      Detail::Login => "Login",
+      Detail::Account => "Account",
+      Detail::Role => "Role",
+      Detail::Region => "Region",
+    }
+  }
+}
+
 /// Settings in a `[<plugin>]` table. Unknown keys are errors, so typos are reported.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
   /// Default scope for plugins with shell sessions.
   pub scope: Option<Scope>,
   /// Named values for saved-choice fields, by collection (e.g. `iam-roles`).
   pub choices: Choices,
+  /// Show the list from the last run while a fresh one loads.
+  pub cache: bool,
+}
+
+impl Default for PluginConfig {
+  fn default() -> Self {
+    Self {
+      scope: None,
+      choices: Choices::default(),
+      cache: true,
+    }
+  }
 }
 
 /// Where a session plugin applies its setup by default.
@@ -96,11 +151,20 @@ mod tests {
     );
 
     assert!(config.plugin("other").scope.is_none());
+    assert!(eks.cache && config.plugin("other").cache);
+    assert!(!Config::parse("[ssm]\ncache = false\n").unwrap().plugin("ssm").cache);
     assert!(Config::parse("[eks]\nscop = \"saved\"\n").is_err());
     assert!(Config::parse("[eks]\nscope = \"temporary\"\n").is_err());
 
     assert!(config.sso.sync);
     assert!(!Config::parse("[sso]\nsync = false\n").unwrap().sso.sync);
     assert!(Config::parse("[sso]\nsink = false\n").is_err());
+
+    assert_eq!(config.selector.details.len(), 4);
+    let selector = Config::parse("[selector]\ndetails = [\"region\", \"account\"]\n")
+      .unwrap()
+      .selector;
+    assert!(matches!(selector.details[..], [Detail::Region, Detail::Account]));
+    assert!(Config::parse("[selector]\ndetails = [\"accounts\"]\n").is_err());
   }
 }

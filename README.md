@@ -162,7 +162,7 @@ awshop --no-login    # switch without checking the SSO login, for example offlin
 | Escape | Leaves without changes |
 | Ctrl-C | Exits, from any menu |
 
-- **The list:** `*` marks the active profile, and the five profiles you set most recently come first. Details, such as the SSO session, role and region, line up in a column.
+- **The list:** `*` marks the active profile, and the five profiles you set most recently come first. Columns with headings show how each profile logs in, its account ID, role and region, and the search matches them too. Choose the columns with `details` in [config.toml](docs/config.md#selector).
 - **The profile's menu:** **Use in this shell** comes first and is highlighted when the menu opens, so pressing Enter twice sets the profile. Below it are the [AWS console](#aws-console) and the plugins, EKS and SSM. ← or Escape goes back to the profile list as you left it.
 
   ```
@@ -249,7 +249,7 @@ See [Prompt](docs/prompt.md) for all segments and options.
 
 ## Configuration
 
-awshop works without configuration. To set defaults, such as the EKS scope or roles to offer, or to turn off the SSO sync, create `~/.config/awshop/config.toml`. See [Configuration](docs/config.md) for the available options and for where awshop keeps what it remembers.
+awshop works without configuration. To set defaults, such as the EKS scope, roles to offer or the details in the profile list, or to turn off the SSO sync or the cached plugin lists, create `~/.config/awshop/config.toml`. See [Configuration](docs/config.md) for the available options and for where awshop keeps what it remembers.
 
 ## Inspect SSO setup
 

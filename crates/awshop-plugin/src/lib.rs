@@ -38,6 +38,8 @@ pub struct Context {
   /// Environment before a shell session, from the host's active session.
   /// A None value records that a variable was originally unset.
   pub original_environment: BTreeMap<String, Option<String>>,
+  /// The account, when the host's login check already looked it up.
+  pub account: Option<Account>,
 }
 
 impl Context {
@@ -92,9 +94,11 @@ pub struct Resource {
   /// Stable, globally scoped identifier, e.g. an ARN (not a display name).
   pub id: String,
   pub label: String,
-  pub detail: String,
+  /// The cells after the label, one per `Plugin::headings` after the first. Empty
+  /// strings are fine; a column that is empty in every row isn't shown.
+  pub columns: Vec<String>,
   /// In use right now, such as the cluster kubectl points at. The list marks it with `*`
-  /// and starts there.
+  /// and starts there. Set by `Plugin::mark_current`, not by `discover`.
   pub current: bool,
 }
 
@@ -188,11 +192,20 @@ pub trait Plugin: Sync {
     None
   }
   /// The resources to pick from, such as the clusters in the context's account and
-  /// region. Keep it to the calls the list needs; see `detail` for slower extras.
+  /// region. Keep it to the calls the list needs; see `columns` for slower extras. The
+  /// host may show the list from an earlier run while this runs, so the result must
+  /// depend only on AWS and the context.
   fn discover(&self, context: &Context) -> Result<Vec<Resource>>;
-  /// A fuller `detail` for a resource from a slower lookup, such as a version. The host
-  /// shows the list first and fills these in as they arrive. None keeps the detail.
-  fn detail(&self, _context: &Context, _resource: &Resource) -> Option<String> {
+  /// Set `current` on the resources in use right now, from local state only, such as
+  /// the kubeconfig. The host calls it for every list it shows, also remembered ones.
+  fn mark_current(&self, _context: &Context, _resources: &mut [Resource]) -> Result<()> {
+    Ok(())
+  }
+  /// The headings of the resource list: the label's, then one per column.
+  fn headings(&self) -> &'static [&'static str];
+  /// Fuller `columns` for a resource from a slower lookup, such as a version. The host
+  /// shows the list first and fills these in as they arrive. None keeps discovery's.
+  fn columns(&self, _context: &Context, _resource: &Resource) -> Option<Vec<String>> {
     None
   }
   /// Describe the setup for a resource. Must not change anything.
@@ -226,27 +239,40 @@ pub fn output(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
 }
 
 /// The AWS account the context's credentials belong to.
+#[derive(Clone)]
 pub struct Account {
   pub id: String,
   /// The ARN partition, such as `aws` or `aws-us-gov`.
   pub partition: String,
 }
 
-/// Look up the account with `sts get-caller-identity`, for building resource ARNs.
-pub fn account(context: &Context) -> Result<Account> {
-  let identity = json(&mut context.aws("sts", "get-caller-identity")?, "AWS identity lookup")?;
-  let id = identity["Account"]
-    .as_str()
-    .ok_or("AWS identity did not contain an account ID.")?;
-  let partition = identity["Arn"]
-    .as_str()
-    .and_then(|arn| arn.split(':').nth(1))
-    .ok_or("AWS identity did not contain an ARN partition.")?;
+impl Account {
+  /// The account in an `sts get-caller-identity` response.
+  pub fn from_identity(identity: &Value) -> Result<Self> {
+    let id = identity["Account"]
+      .as_str()
+      .ok_or("AWS identity did not contain an account ID.")?;
+    let partition = identity["Arn"]
+      .as_str()
+      .and_then(|arn| arn.split(':').nth(1))
+      .ok_or("AWS identity did not contain an ARN partition.")?;
 
-  Ok(Account {
-    id: id.to_owned(),
-    partition: partition.to_owned(),
-  })
+    Ok(Self {
+      id: id.to_owned(),
+      partition: partition.to_owned(),
+    })
+  }
+}
+
+/// The account for building resource ARNs: the host's, or from `sts get-caller-identity`.
+pub fn account(context: &Context) -> Result<Account> {
+  if let Some(account) = &context.account {
+    return Ok(account.clone());
+  }
+  Account::from_identity(&json(
+    &mut context.aws("sts", "get-caller-identity")?,
+    "AWS identity lookup",
+  )?)
 }
 
 /// Run a command and parse its stdout as JSON.

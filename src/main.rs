@@ -5,6 +5,7 @@ use shell::{Bridge, Op};
 use std::{env, io};
 
 mod aws;
+mod cache;
 mod config;
 mod console;
 mod init;

@@ -265,6 +265,8 @@ pub fn choose_profile<'a>(config: &'a AwsConfig, picker: Picker<'_>) -> Result<P
     empty,
   } = picker;
 
+  let details = Config::load()?.selector.details;
+
   // Recent profiles first, most recent on top; the stable sort keeps the rest in order.
   let recent = Preferences::load()
     .map(|preferences| preferences.recent_profiles)
@@ -281,7 +283,10 @@ pub fn choose_profile<'a>(config: &'a AwsConfig, picker: Picker<'_>) -> Result<P
     .iter()
     .map(|profile| {
       let marker = if profile.name == current { " *" } else { "" };
-      ui::Item::new(format!("{}{marker}", profile.name), profile.detail()).describe(description)
+      // The account ID is searchable even when the columns leave it out.
+      ui::Item::columns(format!("{}{marker}", profile.name), profile.cells(&details))
+        .describe(description)
+        .keywords(profile.account.clone().unwrap_or_default())
     })
     .collect();
   let matching: Vec<_> = profiles
@@ -290,7 +295,13 @@ pub fn choose_profile<'a>(config: &'a AwsConfig, picker: Picker<'_>) -> Result<P
     .filter(|(_, item)| item.matches(query))
     .collect();
 
+  let headings: Vec<_> = ["Profile"]
+    .into_iter()
+    .chain(details.iter().map(|detail| detail.heading()))
+    .collect();
+
   let menu = ui::Menu {
+    headings: &headings,
     search: Some(query),
     selected: matching
       .iter()

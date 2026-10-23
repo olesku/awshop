@@ -1,5 +1,6 @@
 //! AWS CLI configuration: profiles, SSO sessions and login checks.
-use awshop_plugin::Result;
+use crate::config::Detail;
+use awshop_plugin::{Account, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -42,30 +43,43 @@ impl Profile {
     }
   }
 
-  /// Short summary of authentication, role and region for selector rows.
-  pub fn detail(&self) -> String {
-    let auth = if let Some(session) = &self.session {
-      format!("SSO session: {session}")
-    } else if self.legacy_sso {
-      "SSO (legacy config)".to_owned()
-    } else if let Some(source) = &self.source_profile {
-      format!("role via {source}")
-    } else if self.name == "default" {
-      "default profile".to_owned()
-    } else {
-      "AWS profile".to_owned()
-    };
+  /// The chosen fields for selector rows, in order; empty where the profile has none.
+  pub fn cells(&self, fields: &[Detail]) -> Vec<String> {
+    fields
+      .iter()
+      .map(|field| match field {
+        Detail::Login => self.login(),
+        Detail::Account => self.account.clone().unwrap_or_default(),
+        Detail::Role => self.role.clone().unwrap_or_default(),
+        Detail::Region => self.region.clone().unwrap_or_default(),
+      })
+      .collect()
+  }
 
-    [Some(auth), self.role.clone(), self.region.clone()]
-      .into_iter()
-      .flatten()
-      .collect::<Vec<_>>()
-      .join(" · ")
+  /// How the profile logs in, in a word or two; empty for plain profiles.
+  fn login(&self) -> String {
+    if let Some(session) = &self.session {
+      format!("SSO {session}")
+    } else if self.legacy_sso {
+      "SSO legacy".to_owned()
+    } else if let Some(source) = &self.source_profile {
+      format!("via {source}")
+    } else {
+      String::new()
+    }
   }
 }
 
+/// The result of a login check.
+pub enum Login {
+  /// The credentials work; the account, when the check could tell it.
+  Valid(Option<Account>),
+  /// The profile uses SSO and needs `aws sso login`.
+  Needed,
+}
+
 /// Profiles (sorted by name) and `[sso-session]` sections.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AwsConfig {
   pub profiles: Vec<Profile>,
   pub sessions: BTreeMap<String, HashMap<String, String>>,
@@ -121,28 +135,47 @@ impl AwsConfig {
     None
   }
 
-  /// Run `aws sso login` when the profile uses SSO and its credentials do not work.
-  /// Other profile types are left to the AWS CLI.
-  pub fn ensure_login(&self, profile: &Profile) -> Result<()> {
-    let Some(login_profile) = self.sso_login_profile(profile) else {
-      return Ok(());
-    };
-
-    let aws_cli = find_aws_cli()?;
-    let identity = Command::new(&aws_cli)
-      .args(["sts", "get-caller-identity", "--profile", &profile.name])
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .status()?;
-    if identity.success() {
-      return Ok(());
+  /// Whether the profile's SSO credentials work, without logging in, so it can run in
+  /// the background. Other profile types are left to the AWS CLI and count as valid.
+  pub fn check_login(&self, profile: &Profile) -> Result<Login> {
+    if self.sso_login_profile(profile).is_none() {
+      return Ok(Login::Valid(None));
     }
 
+    let identity = Command::new(find_aws_cli()?)
+      .args([
+        "sts",
+        "get-caller-identity",
+        "--profile",
+        &profile.name,
+        "--output",
+        "json",
+      ])
+      .stderr(Stdio::null())
+      .output()?;
+    if !identity.status.success() {
+      return Ok(Login::Needed);
+    }
+
+    let account = serde_json::from_slice(&identity.stdout)
+      .ok()
+      .and_then(|identity| Account::from_identity(&identity).ok());
+    Ok(Login::Valid(account))
+  }
+
+  /// Run `aws sso login` when the profile uses SSO and its credentials do not work.
+  /// Returns the account when the check found it, so plugins don't look it up again.
+  pub fn ensure_login(&self, profile: &Profile) -> Result<Option<Account>> {
+    if let Login::Valid(account) = self.check_login(profile)? {
+      return Ok(account);
+    }
+
+    let login_profile = self.sso_login_profile(profile).ok_or("The profile has no SSO login.")?;
     eprintln!(
       "No valid AWS session for '{}'; starting SSO login via '{}'.",
       profile.name, login_profile.name
     );
-    let login = Command::new(&aws_cli)
+    let login = Command::new(find_aws_cli()?)
       .args(["sso", "login", "--profile", &login_profile.name])
       // Stdout is reserved for machine-readable output, so the dialog goes to stderr.
       .stdout(io::stderr())
@@ -150,7 +183,7 @@ impl AwsConfig {
     if !login.success() {
       return Err(format!("AWS SSO login failed for profile '{}' ({login}).", login_profile.name).into());
     }
-    Ok(())
+    Ok(None)
   }
 }
 
@@ -233,11 +266,12 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::config::Config;
 
   #[test]
   fn parses_profiles_sessions_and_role_chains() {
     let config = AwsConfig::parse(
-      "# comment\n[default]\nregion = eu-north-1\n[profile dev]\nsso_session = corp\nsso_role_name = Admin\n\
+      "# comment\n[default]\nregion = eu-north-1\n[profile dev]\nsso_session = corp\nsso_account_id = 123456789012\nsso_role_name = Admin\n\
              [profile legacy]\nsso_start_url = https://example\n[profile chained]\nsource_profile = dev\n\
              [profile loop-a]\nsource_profile = loop-b\n[profile loop-b]\nsource_profile = loop-a\n\
              [sso-session corp]\nsso_region = eu-north-1\n",
@@ -246,7 +280,13 @@ mod tests {
     assert_eq!(config.profile("default").unwrap().region.as_deref(), Some("eu-north-1"));
     assert!(config.sessions.contains_key("corp"));
     assert!(config.profile("legacy").unwrap().legacy_sso);
-    assert_eq!(config.profile("dev").unwrap().detail(), "SSO session: corp · Admin");
+    let dev = config.profile("dev").unwrap();
+    assert_eq!(
+      dev.cells(&Config::default().selector.details),
+      ["SSO corp", "123456789012", "Admin", ""]
+    );
+    assert_eq!(dev.cells(&[Detail::Role]), ["Admin"]);
+    assert_eq!(config.profile("chained").unwrap().cells(&[Detail::Login]), ["via dev"]);
 
     let login = |name| {
       config

@@ -15,7 +15,8 @@ Plugins are Rust crates compiled into awshop. They use the `awshop-plugin` contr
 | `src/session.rs` | Session directories, manifests, ownership and cleanup |
 | `src/shell.rs` | The code channel to the shell function: ops, rendering and quoting |
 | `src/preferences.rs` | Remembered settings in the state file (JSON in `$XDG_STATE_HOME`), atomic writes |
-| `src/config.rs` | `config.toml`: `[sso]`, and per-plugin `scope` and named `choices` (see [Configuration](config.md)) |
+| `src/cache.rs` | Resource lists from earlier runs (JSON in `$XDG_CACHE_HOME`), shown while a fresh list loads |
+| `src/config.rs` | `config.toml`: `[sso]`, `[selector]`, and per-plugin `scope`, `cache` and named `choices` (see [Configuration](config.md)) |
 | `src/plugins/mod.rs` | Built-in plugin registry |
 | `src/selector.rs` | Profile selector, recent profiles and each profile's menu of actions |
 | `src/sso.rs` | Profiles from the SSO portal, in awshop's block of the AWS config (see [Accounts from SSO](sso.md)) |
@@ -28,17 +29,31 @@ The plugin crate does not depend on crossterm, the host binary, or the preferenc
 
 1. The host resolves the plugin's declared executables in `PATH` and checks that they are executable. A missing required one stops the plugin with its installation advice; a missing optional one is left out of `Context::executables`.
 2. It resolves the profile and region, and checks SSO when appropriate. `--no-login` skips the SSO preflight.
-3. `discover(context)` returns resources. Use a stable ID that includes account and region, such as an ARN. Names are for display; IDs scope saved settings. Set `current` on the one in use right now, such as the cluster kubectl points at: the list marks it with `*` and starts there. Keep it to the calls the list needs. For slower extras, such as a version per resource, implement `detail(context, resource)`: the host shows the list at once, calls it for every resource in the background, and replaces each row's detail as answers arrive.
-4. After selection, `prepare(context, resource, saved)` describes the setup: action label, fields, defaults and notes. It must not perform the action or write configuration.
-5. The host renders the setup and provides editors according to each field's kind. A setup with no fields, no session scope and no `launch` has nothing to review, so the host runs the action as soon as the resource is selected. A field's `description` appears below the list when its editor is highlighted. `validate_field` runs after edits and before execution.
-6. Only selecting the action calls `execute(context, resource, settings)`. The outcome contains a one-line confirmation and optional details, such as the file that was written. Keep both short; progress messages are not printed. Details are omitted for temporary sessions, whose files the host manages.
-7. On success, the host saves the original field values (never temporary file paths) under plugin → profile → resource ID, along with any named choices. Escape and Ctrl-C do not commit preferences.
+3. `discover(context)` returns resources. Use a stable ID that includes account and region, such as an ARN. Names are for display; IDs scope saved settings. Keep it to the calls the list needs, and let the result depend only on AWS and the context, because the host caches it.
+4. `mark_current(context, resources)` sets `current` on the one in use right now, such as the cluster kubectl points at: the list marks it with `*` and starts there. It reads local state only, and the host calls it for every list it shows, also a cached one.
+5. After selection, `prepare(context, resource, saved)` describes the setup: action label, fields, defaults and notes. It must not perform the action or write configuration.
+6. The host renders the setup and provides editors according to each field's kind. A setup with no fields, no session scope and no `launch` has nothing to review, so the host runs the action as soon as the resource is selected. A field's `description` appears below the list when its editor is highlighted. `validate_field` runs after edits and before execution.
+7. Only selecting the action calls `execute(context, resource, settings)`. The outcome contains a one-line confirmation and optional details, such as the file that was written. Keep both short; progress messages are not printed. Details are omitted for temporary sessions, whose files the host manages.
+8. On success, the host saves the original field values (never temporary file paths) under plugin → profile → resource ID, along with any named choices. Escape and Ctrl-C do not commit preferences.
+
+The list has columns: `headings()` names the label's column and one per entry in `Resource::columns`, and a column that is empty in every row isn't shown. For slower extras, such as a version per resource, leave those cells empty in `discover` and implement `columns(context, resource)`: the host shows the list at once, calls it for every resource in the background, and replaces each row's columns as answers arrive.
 
 AWS commands should use `Context::aws(service, operation)`, which binds the displayed profile and region explicitly, disables the pager and automatic prompts, and uses JSON output. `Context::command(name)` resolves other declared executables. `json` and `output` check exit status and preserve command errors. Pass arguments individually through `Command`; do not build shell command strings.
 
-An action can itself be an interactive program, such as a shell on an instance for SSM: `execute` returns it in `Outcome::open`, and the host gives it the terminal, waits, and shows `message` afterwards. `account(context)` returns the account ID and ARN partition for resource IDs.
+An action can itself be an interactive program, such as a shell on an instance for SSM: `execute` returns it in `Outcome::open`, and the host gives it the terminal, waits, and shows `message` afterwards. `account(context)` returns the account ID and ARN partition for resource IDs. It uses `Context::account` when the host's SSO login check already found it, and asks `sts get-caller-identity` otherwise.
 
 A plugin can also offer to open an interactive program after its action, such as k9s for EKS. Declare the program as a `Dependency` with `optional: true`; the host resolves it only when it is in `PATH`. When it is in `Context::executables`, `prepare` returns `Setup::launch` with the action labels, and `launch` builds the command. The host shows the extra action, runs the setup as usual, then gives the program the terminal and waits for it.
+
+## Cached lists
+
+The host remembers the last list per plugin, profile and region, and shows it at once the next time while `discover` runs in the background. The fresh list then replaces it, with the search and the highlighted resource kept.
+
+- **Never for actions:** choosing a resource from a cached list waits for the fresh one, and continues only if that list still has the resource's ID. Going back from the setup shows the fresh list.
+- **No login in the background:** the background run checks the SSO login without logging in. When the profile needs a login, the host waits for AWS as without a cache, so the login dialog looks the same. When discovery fails, its error shows at once.
+- **Saving:** a fresh list is saved when it is shown, however the menu is left, and when a resource is chosen from a cached list. An empty list isn't shown from the cache, since it would hide that AWS is still loading.
+- **Columns:** `columns` runs only for fresh lists. Until it answers, an empty cell shows what it had last time; when it returns None, the row shows `discover`'s columns again, so an old version doesn't stay.
+- **Where it says so:** below the list, **Last loaded … · Waiting for AWS…**, so the rows keep their place when the fresh list replaces them.
+- **Current:** `current` is never cached; `mark_current` runs on the cached list too.
 
 ## Setup fields
 

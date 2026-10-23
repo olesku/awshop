@@ -63,19 +63,14 @@ impl Plugin for Eks {
       .as_array()
       .ok_or("EKS response did not contain a cluster list.")?;
 
-    // Status reflects what kubectl uses now: every KUBECONFIG file, including a session.
-    let view = kubeconfig(context, None)?;
     let mut resources = Vec::new();
     for name in names {
       let name = name.as_str().ok_or("EKS returned an invalid cluster name.")?;
-      let arn = format!("arn:{partition}:eks:{}:{account}:cluster/{name}", context.region);
-      let current =
-        contexts(&view).any(|entry| entry["context"]["cluster"] == arn && entry["name"] == view["current-context"]);
       resources.push(Resource {
-        id: arn,
+        id: format!("arn:{partition}:eks:{}:{account}:cluster/{name}", context.region),
         label: name.to_owned(),
-        detail: String::new(),
-        current,
+        columns: vec![String::new(); 2],
+        current: false,
       });
     }
 
@@ -83,19 +78,31 @@ impl Plugin for Eks {
     Ok(resources)
   }
 
-  /// The Kubernetes version, and the status when it isn't ACTIVE, from
-  /// `eks describe-cluster`. Without eks:DescribeCluster the list shows neither.
-  fn detail(&self, context: &Context, resource: &Resource) -> Option<String> {
+  /// The cluster of kubectl's current context, from every KUBECONFIG file, including a
+  /// session's.
+  fn mark_current(&self, context: &Context, resources: &mut [Resource]) -> Result<()> {
+    let view = kubeconfig(context, None)?;
+    let current = contexts(&view).find(|entry| entry["name"] == view["current-context"]);
+    for resource in resources {
+      resource.current = current.is_some_and(|entry| entry["context"]["cluster"] == resource.id);
+    }
+    Ok(())
+  }
+
+  fn headings(&self) -> &'static [&'static str] {
+    &["Cluster", "Version", "Status"]
+  }
+
+  /// The Kubernetes version and status from `eks describe-cluster`. Without
+  /// eks:DescribeCluster the list shows neither.
+  fn columns(&self, context: &Context, resource: &Resource) -> Option<Vec<String>> {
     let mut command = context.aws("eks", "describe-cluster").ok()?;
     command.args(["--name", &resource.label]);
     let described = json(&mut command, "EKS cluster description").ok()?;
     let cluster = &described["cluster"];
     let version = format!("v{}", cluster["version"].as_str()?);
-
-    Some(match cluster["status"].as_str().filter(|status| *status != "ACTIVE") {
-      Some(status) => format!("{version} · {status}"),
-      None => version,
-    })
+    let status = cluster["status"].as_str().unwrap_or_default().to_owned();
+    Some(vec![version, status])
   }
 
   /// Prefill from saved settings, else from an existing context for this cluster and
@@ -357,11 +364,12 @@ mod tests {
       region: "eu-north-1".into(),
       executables: [("aws".into(), PathBuf::from("/test/aws"))].into(),
       original_environment: Default::default(),
+      account: None,
     };
     let resource = Resource {
       id: "cluster-arn".into(),
       label: "dev-1".into(),
-      detail: String::new(),
+      columns: Vec::new(),
       current: false,
     };
     let settings = [
@@ -395,11 +403,12 @@ mod tests {
       region: "eu-north-1".into(),
       executables: [("k9s".into(), PathBuf::from("/test/k9s"))].into(),
       original_environment: Default::default(),
+      account: None,
     };
     let resource = Resource {
       id: "cluster-arn".into(),
       label: "dev-1".into(),
-      detail: String::new(),
+      columns: Vec::new(),
       current: false,
     };
     let settings = [

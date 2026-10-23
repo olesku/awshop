@@ -1,6 +1,7 @@
 //! Generic plugin host: dependencies, AWS context, navigation and preferences.
 use crate::{
-  aws::{self, AwsConfig},
+  aws::{self, AwsConfig, Login},
+  cache,
   config::{Config, Scope},
   preferences::{self, Choices, Preferences},
   selector::{choose_profile, Pick, Picker},
@@ -8,7 +9,7 @@ use crate::{
   shell::Op,
   ui::{self, Choice, Item, Menu},
 };
-use awshop_plugin::{Context, Field, FieldKind, Plugin, Resource, Result, Setup};
+use awshop_plugin::{Account, Context, Field, FieldKind, Plugin, Resource, Result, Setup};
 use std::{
   collections::BTreeMap,
   env,
@@ -16,10 +17,13 @@ use std::{
   process::{Command, Stdio},
   sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
   },
   thread,
 };
+
+/// A fresh resource list, or why it could not load.
+type Loaded = std::result::Result<Vec<Resource>, String>;
 
 /// Background workers that fetch slower resource details at once.
 const DETAIL_WORKERS: usize = 8;
@@ -225,6 +229,7 @@ fn browse(plugin: &'static dyn Plugin, options: Options, owner: Option<u32>) -> 
     region,
     executables,
     original_environment,
+    account: None,
   };
 
   // From here on the screen stays up until the plugin is done. Through the profile
@@ -239,124 +244,360 @@ fn browse(plugin: &'static dyn Plugin, options: Options, owner: Option<u32>) -> 
 
   // Check the login once per profile, also after Ctrl-P changes it.
   let mut authenticated_profile = String::new();
+  let mut query = options.query.clone();
+  // What a background fetch got, to show next as it is: the list, or why it failed.
+  let mut fetched: Option<Loaded> = None;
+  // Wait for AWS instead of showing the last list: after Ctrl-L or an error, or when
+  // the background fetch found that the profile needs a login.
+  let mut wait = false;
+  // The resource to highlight in the next list, by ID.
+  let mut highlight: Option<String> = None;
   loop {
-    ui::busy(&title, &context_lines(&context))?;
-    if !options.no_login && authenticated_profile != context.profile {
-      let profile = config
-        .profile(&context.profile)
-        .ok_or("Selected AWS profile was not found.")?;
-      config.ensure_login(profile)?;
-      authenticated_profile.clone_from(&context.profile);
-    }
+    // A remembered list only ever bridges the wait: actions use a fresh one. An empty
+    // one would hide that AWS is still loading, so it counts as none.
+    let check_login = !options.no_login && authenticated_profile != context.profile;
+    let remembered = match (&fetched, plugin_config.cache && !wait) {
+      (None, true) => cache::load(plugin.name(), &context.profile, &context.region)
+        .filter(|remembered| !remembered.resources.is_empty()),
+      _ => None,
+    };
+    let remembered = remembered.and_then(|mut remembered| {
+      plugin.mark_current(&context, &mut remembered.resources).ok()?;
+      let background = Background::start(plugin, &config, &context, check_login)?;
+      Some((remembered, background))
+    });
+    wait = false;
 
-    let resources = match plugin.discover(&context) {
+    // A fresh list gets its current resource marked here, also one fetched before a
+    // setup that may have changed it.
+    let (loaded, background, age) = match (fetched.take(), remembered) {
+      (Some(loaded), _) => (loaded, None, None),
+      (None, Some((remembered, background))) => (Ok(remembered.resources), Some(background), Some(remembered.age)),
+      (None, None) => {
+        ui::busy(&title, &context_lines(&context))?;
+        if check_login {
+          let profile = config
+            .profile(&context.profile)
+            .ok_or("Selected AWS profile was not found.")?;
+          context.account = config.ensure_login(profile)?;
+          authenticated_profile.clone_from(&context.profile);
+        }
+        (plugin.discover(&context).map_err(|error| error.to_string()), None, None)
+      }
+    };
+    let loaded = match (loaded, &background) {
+      (Ok(mut resources), None) => plugin
+        .mark_current(&context, &mut resources)
+        .map(|_| resources)
+        .map_err(|error| error.to_string()),
+      (loaded, _) => loaded,
+    };
+    let mut resources = match loaded {
       Ok(resources) => resources,
       Err(error) => {
-        ui::notice(&format!("{title} › Could not load resources"), &error.to_string())?;
-        let items = [
-          Item::new("Retry", ""),
-          Item::new("Change profile", ""),
-          Item::new("Change region", ""),
-        ];
-        match ui::choose(Menu {
-          context: &context_lines(&context),
-          root: !options.nested,
-          ..Menu::new(&title, &items)
-        })? {
-          Choice::Selected(0) => {}
-          Choice::Selected(1) => {
-            change_profile(&mut context, &config)?;
-          }
-          Choice::Selected(2) => {
-            change_region(&mut context, &config)?;
-          }
-          _ => return Ok(None),
-        }
+        wait = match retry(&title, &error, &mut context, &config, options.nested)? {
+          Some(wait) => wait,
+          None => return Ok(None),
+        };
         continue;
       }
     };
 
+    // Slower columns arrive in the background for a fresh list, from a few workers
+    // sharing the resources. Until a worker has them, an empty cell shows what it had
+    // last time; a worker without them shows discovery's. A worker stops once the menu
+    // is gone and its channel closed. What they find is kept for the cache.
+    let (sender, updates) = mpsc::channel();
+    let seen = Arc::new(Mutex::new(vec![None; resources.len()]));
+    if background.is_none() {
+      let next = Arc::new(AtomicUsize::new(0));
+      let shared = Arc::new(resources.clone());
+      for _ in 0..DETAIL_WORKERS.min(resources.len()) {
+        let (sender, context, shared, next, seen) = (
+          sender.clone(),
+          context.clone(),
+          shared.clone(),
+          next.clone(),
+          seen.clone(),
+        );
+        // Without a worker, the list just shows no details.
+        let _ = thread::Builder::new().spawn(move || loop {
+          let index = next.fetch_add(1, Ordering::SeqCst);
+          let Some(resource) = shared.get(index) else {
+            break;
+          };
+          let columns = plugin
+            .columns(&context, resource)
+            .unwrap_or_else(|| resource.columns.clone());
+          if let Some(slot) = seen.lock().ok().as_mut().and_then(|seen| seen.get_mut(index)) {
+            *slot = Some(columns.clone());
+          }
+          if sender.send((index, columns)).is_err() {
+            break;
+          }
+        });
+      }
+
+      if plugin_config.cache {
+        prefill(plugin, &context, &mut resources);
+      }
+    }
+
+    // A remembered list says so below the rows, which keep their place when the fresh
+    // list replaces it.
+    let waiting = age
+      .map(|age| format!("Last loaded {} · Waiting for AWS…", cache::ago(age)))
+      .unwrap_or_default();
     let items: Vec<_> = resources
       .iter()
       .map(|resource| {
         let marker = if resource.current { " *" } else { "" };
-        Item::new(format!("{}{marker}", resource.label), &resource.detail)
+        Item::columns(format!("{}{marker}", resource.label), resource.columns.clone()).describe(&waiting)
       })
       .collect();
 
-    // Like the profile selector: * marks the current one, and the list starts there.
+    // Like the profile selector: * marks the current one, and the list starts there,
+    // unless it is shown again for a resource that was highlighted.
     let list_title = if resources.iter().any(|resource| resource.current) {
       format!("{title} · * marks the current one")
     } else {
       title.clone()
     };
-    let selected = items
+    let matching: Vec<_> = items
       .iter()
       .zip(&resources)
-      .filter(|(item, _)| item.matches(&options.query))
-      .position(|(_, resource)| resource.current)
+      .filter(|(item, _)| item.matches(&query))
+      .map(|(_, resource)| resource)
+      .collect();
+    let selected = matching
+      .iter()
+      .position(|resource| highlight.as_ref() == Some(&resource.id))
+      .or_else(|| matching.iter().position(|resource| resource.current))
       .unwrap_or(0);
+    highlight = None;
 
-    // Slower details arrive in the background while the list is already usable, from a
-    // few workers sharing the resources. A worker stops once the menu is gone and its
-    // channel closed.
-    let (sender, updates) = mpsc::channel();
-    let next = Arc::new(AtomicUsize::new(0));
-    let shared = Arc::new(resources.clone());
-    for _ in 0..DETAIL_WORKERS.min(resources.len()) {
-      let (sender, context, shared, next) = (sender.clone(), context.clone(), shared.clone(), next.clone());
-      // Without a worker, the list just shows no details.
-      let _ = thread::Builder::new().spawn(move || loop {
-        let index = next.fetch_add(1, Ordering::SeqCst);
-        let Some(resource) = shared.get(index) else {
-          break;
-        };
-        if let Some(detail) = plugin.detail(&context, resource) {
-          if sender.send((index, detail)).is_err() {
-            break;
-          }
-        }
-      });
-    }
-
-    match ui::choose(Menu {
+    let choice = ui::choose(Menu {
       context: &context_lines(&context),
-      search: Some(&options.query),
+      headings: plugin.headings(),
+      search: Some(&query),
       shortcuts: &[('p', "profile"), ('r', "region"), ('l', "reload")],
       empty: "No matching resources. Ctrl-R: region · Ctrl-P: profile · Ctrl-L: retry",
       root: !options.nested,
       updates: Some(&updates),
+      refresh: background.as_ref().map(|background| &background.done),
       selected,
       ..Menu::new(&list_title, &items)
-    })? {
+    });
+
+    // A fresh list is saved however the menu was left, Ctrl-C included, with the
+    // columns the workers found so far. Cells they haven't answered keep what they had.
+    if background.is_none() && plugin_config.cache {
+      if let Ok(seen) = seen.lock() {
+        for (resource, columns) in resources.iter_mut().zip(seen.iter()) {
+          if let Some(columns) = columns {
+            resource.columns.clone_from(columns);
+          }
+        }
+      }
+      // The cache only saves a wait, so failing to write it changes nothing else.
+      let _ = cache::save(plugin.name(), &context.profile, &context.region, &resources);
+    }
+
+    let index = match choice? {
       Choice::Back => return Ok(None),
       Choice::Shortcut('p') => {
         change_profile(&mut context, &config)?;
+        continue;
       }
       Choice::Shortcut('r') => {
         change_region(&mut context, &config)?;
+        continue;
       }
-      Choice::Selected(index) => {
-        let resource = &resources[index];
-        let saved = preferences.settings(plugin.name(), &context.profile, &resource.id);
-        let mut setup = match plugin.prepare(&context, resource, &saved) {
-          Ok(setup) => setup,
-          Err(error) => {
-            ui::notice(&format!("{title} › Could not read setup"), &error.to_string())?;
-            continue;
-          }
-        };
-
-        // Named values entered during this setup are committed only after success.
-        let mut named = NamedValues {
-          configured: plugin_config.choices.clone(),
-          remembered: preferences.choices.get(plugin.name()).cloned().unwrap_or_default(),
-        };
-        if let Some(ops) = configure(plugin, &context, resource, &mut setup, &mut named, &mut mode)? {
-          return Ok(Some((context.profile.clone(), ops)));
+      Choice::Shortcut('l') => {
+        wait = true;
+        continue;
+      }
+      // The fresh list arrived: show it with the same search and highlight.
+      Choice::Refresh(index, filter) => {
+        query = filter;
+        highlight = index
+          .and_then(|index| resources.get(index))
+          .map(|resource| resource.id.clone());
+        if let Some(background) = background {
+          (fetched, wait) = background.finish(&mut context, &mut authenticated_profile);
         }
+        continue;
       }
-      _ => {}
+      Choice::Selected(index) => index,
+      _ => continue,
+    };
+
+    // A choice from a remembered list waits for the fresh one, which must still have it.
+    // The fresh list is kept, so going back from the setup shows it, and saved now,
+    // since a setup that succeeds doesn't come back to the list.
+    let mut resource = resources.swap_remove(index);
+    if let Some(background) = background {
+      ui::busy(&title, &context_lines(&context))?;
+      (fetched, wait) = background.finish(&mut context, &mut authenticated_profile);
+      highlight = Some(resource.id.clone());
+      let Some(Ok(fresh)) = fetched.as_mut() else {
+        continue;
+      };
+      if plugin_config.cache {
+        let mut saved = fresh.clone();
+        prefill(plugin, &context, &mut saved);
+        let _ = cache::save(plugin.name(), &context.profile, &context.region, &saved);
+      }
+      let Some(found) = fresh.iter().find(|fresh| fresh.id == resource.id) else {
+        ui::notice(
+          &format!("{title} › {}", resource.label),
+          &format!("{} is no longer in the list from AWS.", resource.label),
+        )?;
+        continue;
+      };
+      resource = found.clone();
+    }
+
+    let saved = preferences.settings(plugin.name(), &context.profile, &resource.id);
+    let mut setup = match plugin.prepare(&context, &resource, &saved) {
+      Ok(setup) => setup,
+      Err(error) => {
+        ui::notice(&format!("{title} › Could not read setup"), &error.to_string())?;
+        continue;
+      }
+    };
+
+    // Named values entered during this setup are committed only after success.
+    let mut named = NamedValues {
+      configured: plugin_config.choices.clone(),
+      remembered: preferences.choices.get(plugin.name()).cloned().unwrap_or_default(),
+    };
+    if let Some(ops) = configure(plugin, &context, &resource, &mut setup, &mut named, &mut mode)? {
+      return Ok(Some((context.profile.clone(), ops)));
+    }
+  }
+}
+
+/// Say why the list could not load, and offer to retry or change the profile or region.
+/// None when the user leaves instead; otherwise whether the next list waits for AWS,
+/// which a retry does, while another profile or region may show its remembered list.
+fn retry(title: &str, error: &str, context: &mut Context, config: &AwsConfig, nested: bool) -> Result<Option<bool>> {
+  ui::notice(&format!("{title} › Could not load resources"), error)?;
+  let items = [
+    Item::new("Retry", ""),
+    Item::new("Change profile", ""),
+    Item::new("Change region", ""),
+  ];
+  Ok(
+    match ui::choose(Menu {
+      context: &context_lines(context),
+      root: !nested,
+      ..Menu::new(title, &items)
+    })? {
+      Choice::Selected(0) => Some(true),
+      Choice::Selected(1) => {
+        change_profile(context, config)?;
+        Some(false)
+      }
+      Choice::Selected(2) => {
+        // Without a new region, the next list is the same one again.
+        Some(!change_region(context, config)?)
+      }
+      _ => None,
+    },
+  )
+}
+
+/// Fill empty cells from the list remembered for the context, by resource ID, until
+/// the column workers answer.
+fn prefill(plugin: &dyn Plugin, context: &Context, resources: &mut [Resource]) {
+  let Some(last) = cache::load(plugin.name(), &context.profile, &context.region) else {
+    return;
+  };
+  for resource in resources {
+    let Some(previous) = last.resources.iter().find(|previous| previous.id == resource.id) else {
+      continue;
+    };
+    for (cell, previous) in resource.columns.iter_mut().zip(&previous.columns) {
+      if cell.is_empty() {
+        cell.clone_from(previous);
+      }
+    }
+  }
+}
+
+/// A fresh list loading while a remembered one is shown. It never logs in: that needs
+/// the terminal, so a needed login waits for the list as without a cache.
+struct Background {
+  /// Gets a message when the fetch is done, which refreshes the menu.
+  done: mpsc::Receiver<()>,
+  handle: thread::JoinHandle<Fetched>,
+  check_login: bool,
+}
+
+/// How a background fetch ended.
+enum Fetched {
+  /// The list, and the context's account: the one the login check found, if it ran.
+  List(Vec<Resource>, Option<Account>),
+  /// The profile needs `aws sso login`.
+  Login,
+  /// AWS or the plugin failed, with the error.
+  Failed(String),
+}
+
+impl Background {
+  /// Fetch the list for the context, checking the login first when `check_login` is set.
+  /// None when no thread could be started.
+  fn start(plugin: &'static dyn Plugin, config: &AwsConfig, context: &Context, check_login: bool) -> Option<Self> {
+    let (sender, done) = mpsc::channel();
+    let (config, mut context) = (config.clone(), context.clone());
+    let handle = thread::Builder::new()
+      .spawn(move || {
+        let login = if check_login {
+          config
+            .profile(&context.profile)
+            .ok_or_else(|| "Selected AWS profile was not found.".into())
+            .and_then(|profile| config.check_login(profile))
+        } else {
+          Ok(Login::Valid(context.account.clone()))
+        };
+        let fetched = match login {
+          Ok(Login::Valid(account)) => {
+            context.account = account;
+            match plugin.discover(&context) {
+              Ok(resources) => Fetched::List(resources, context.account.clone()),
+              Err(error) => Fetched::Failed(error.to_string()),
+            }
+          }
+          Ok(Login::Needed) => Fetched::Login,
+          Err(error) => Fetched::Failed(error.to_string()),
+        };
+        let _ = sender.send(());
+        fetched
+      })
+      .ok()?;
+
+    Some(Self {
+      done,
+      handle,
+      check_login,
+    })
+  }
+
+  /// Wait for the fetch. Returns the list or error to show next, or None and that the
+  /// next list must wait for a login. A finished login check counts for the profile.
+  fn finish(self, context: &mut Context, authenticated_profile: &mut String) -> (Option<Loaded>, bool) {
+    match self.handle.join() {
+      Ok(Fetched::List(resources, account)) => {
+        context.account = account;
+        if self.check_login {
+          authenticated_profile.clone_from(&context.profile);
+        }
+        (Some(Ok(resources)), false)
+      }
+      Ok(Fetched::Login) => (None, true),
+      Ok(Fetched::Failed(error)) => (Some(Err(error)), false),
+      Err(_) => (Some(Err("Loading the list stopped unexpectedly.".to_owned())), false),
     }
   }
 }

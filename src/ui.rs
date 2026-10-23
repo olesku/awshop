@@ -194,17 +194,26 @@ pub fn busy(title: &str, context: &[String]) -> io::Result<()> {
 #[derive(Clone)]
 pub struct Item {
   pub label: String,
-  pub detail: String,
+  /// Detail columns after the label, lined up across rows.
+  pub columns: Vec<String>,
   pub description: String,
+  /// Text the search matches without showing it.
+  pub keywords: String,
 }
 
 impl Item {
   /// A row with a label and a detail column.
   pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+    Self::columns(label, vec![detail.into()])
+  }
+
+  /// A row with a label and any number of detail columns.
+  pub fn columns(label: impl Into<String>, columns: Vec<String>) -> Self {
     Self {
       label: label.into(),
-      detail: detail.into(),
+      columns,
       description: String::new(),
+      keywords: String::new(),
     }
   }
 
@@ -214,9 +223,15 @@ impl Item {
     self
   }
 
-  /// Case-insensitive search over the label and detail.
+  /// Text the search matches in addition to the label and detail.
+  pub fn keywords(mut self, keywords: impl Into<String>) -> Self {
+    self.keywords = keywords.into();
+    self
+  }
+
+  /// Case-insensitive search over the label, columns and keywords.
   pub fn matches(&self, query: &str) -> bool {
-    format!("{} {}", self.label, self.detail)
+    format!("{} {} {}", self.label, self.columns.join(" "), self.keywords)
       .to_lowercase()
       .contains(&query.to_lowercase())
   }
@@ -240,6 +255,8 @@ pub struct Menu<'a> {
   /// Lines between the title and the list, such as the current profile and region.
   pub context: &'a [String],
   pub items: &'a [Item],
+  /// Column headings above the list, the label's first; none shows no heading row.
+  pub headings: &'a [&'a str],
   /// Some enables type-to-filter, starting with this text.
   pub search: Option<&'a str>,
   /// Initial position among the items that match the initial search.
@@ -254,8 +271,8 @@ pub struct Menu<'a> {
   pub root: bool,
   /// Art drawn centered above the search when the terminal has room for it.
   pub banner: &'a [&'a str],
-  /// New details for items, by index, shown as they arrive.
-  pub updates: Option<&'a Receiver<(usize, String)>>,
+  /// New columns for items, by index, shown as they arrive.
+  pub updates: Option<&'a Receiver<(usize, Vec<String>)>>,
   /// A message here returns `Choice::Refresh`, so the caller can rebuild the items.
   pub refresh: Option<&'a Receiver<()>>,
   /// Shown when no item matches.
@@ -269,6 +286,7 @@ impl<'a> Menu<'a> {
       title,
       context: &[],
       items,
+      headings: &[],
       search: None,
       selected: 0,
       shortcuts: &[],
@@ -327,9 +345,9 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
       if menu.refresh.is_some_and(|refresh| refresh.try_recv().is_ok()) {
         return Ok(Choice::Refresh(matches.get(selected).copied(), filter));
       }
-      for (index, detail) in menu.updates.into_iter().flat_map(Receiver::try_iter) {
+      for (index, columns) in menu.updates.into_iter().flat_map(Receiver::try_iter) {
         if let Some(item) = items.get_mut(index) {
-          item.detail = detail;
+          item.columns = columns;
           dirty = true;
         }
       }
@@ -471,9 +489,10 @@ fn draw_frame(
   }
 
   // The banner goes first when rows run short: it needs room for six list rows besides.
+  let heading_rows = usize::from(!menu.headings.is_empty());
   let banner_width = menu.banner.iter().map(|line| line.width()).max().unwrap_or(0);
   let banner_rows = if usize::from(height)
-    >= 2 + context_rows + menu.banner.len() + 1 + 6 + 1 + usize::from(status_rows)
+    >= 2 + context_rows + menu.banner.len() + 1 + heading_rows + 6 + 1 + usize::from(status_rows)
     && usize::from(width) > banner_width
   {
     menu.banner.len()
@@ -506,24 +525,59 @@ fn draw_frame(
     line(out, search_row, search, width, Color::Reset)?;
   }
 
-  let start = search_row + 1;
+  let start = search_row + 1 + heading_rows as u16;
   let visible = usize::from(height.saturating_sub(start + 2 + status_rows)).max(1);
   let first = selected.saturating_sub(visible - 1);
 
-  // Details line up in a column after the longest label, but at most halfway across.
-  let column = menu
-    .items
-    .iter()
-    .map(|item| item.label.width())
-    .max()
-    .unwrap_or(0)
-    .min(usize::from(width) / 2);
+  // Columns are as wide as their widest cell or heading, over all items so they stay put
+  // while searching; the labels take at most half the width. A column that is empty in
+  // every row is left out with its heading (None). Columns that don't fit are cut off at
+  // the right edge.
+  let heading = |index: usize| menu.headings.get(index).copied().unwrap_or("");
+  let column_count = menu.items.iter().map(|item| item.columns.len()).max().unwrap_or(0);
+  let widths: Vec<_> = (0..=column_count)
+    .map(|index| {
+      let widest = menu
+        .items
+        .iter()
+        .map(|item| match index {
+          0 => item.label.width(),
+          _ => item.columns.get(index - 1).map_or(0, |cell| cell.width()),
+        })
+        .max()
+        .unwrap_or(0);
+      match index {
+        0 => Some(widest.max(heading(0).width()).min(usize::from(width) / 2)),
+        _ if widest == 0 => None,
+        _ => Some(widest.max(heading(index).width())),
+      }
+    })
+    .collect();
+  let row = |marker: &str, cells: Vec<&str>| {
+    let mut text = format!("{marker} ");
+    for (cell, column) in cells.iter().zip(&widths) {
+      let Some(column) = column else {
+        continue;
+      };
+      text.push_str(cell);
+      text.push_str(&" ".repeat(column.saturating_sub(cell.width()) + 2));
+    }
+    text.trim_end().to_owned()
+  };
+
+  if heading_rows > 0 {
+    let cells = (0..widths.len()).map(heading).collect();
+    line(out, search_row + 1, &row(" ", cells), width, Color::DarkGrey)?;
+  }
 
   for (offset, position) in (first..(first + visible).min(matches.len())).enumerate() {
     let item = &menu.items[matches[position]];
     let marker = if position == selected { "›" } else { " " };
-    let padding = " ".repeat(column.saturating_sub(item.label.width()));
-    let text = format!("{marker} {}{padding}  {}", item.label, item.detail);
+    let cells = [item.label.as_str()]
+      .into_iter()
+      .chain(item.columns.iter().map(String::as_str))
+      .collect();
+    let text = row(marker, cells);
     line(
       out,
       start + offset as u16,
@@ -780,6 +834,46 @@ mod tests {
     assert_eq!(rows[3], "› dev         SSO session");
     assert_eq!(rows[4], "  production  role via dev");
     assert_eq!(rows[5], "  界          wide");
+  }
+
+  #[test]
+  fn columns_line_up_under_headings_and_are_cut_at_the_right_edge() {
+    let row = |label: &str, cells: &[&str]| Item::columns(label, cells.iter().map(|cell| cell.to_string()).collect());
+    let items = [
+      row("dev", &["SSO corp", "111111111111", "eu-north-1"]),
+      row("ci-deploy", &["via dev", "", "eu-west-1"]),
+    ];
+    let menu = Menu {
+      headings: &["Profile", "Login", "Account", "Region"],
+      ..selector(&items)
+    };
+
+    let mut terminal = vt100::Parser::new(12, 60, 0);
+    render(&mut terminal, &menu, &[0, 1], 0, Some("Search: "));
+    let rows: Vec<_> = terminal.screen().rows(0, 60).collect();
+    assert_eq!(rows[3], "  Profile    Login     Account       Region");
+    assert_eq!(rows[4], "› dev        SSO corp  111111111111  eu-north-1");
+    assert_eq!(rows[5], "  ci-deploy  via dev                 eu-west-1");
+
+    // A column that is empty in every row is left out, with its heading.
+    let sparse = [row("dev", &["", "eu-north-1"]), row("prod", &["", "us-east-1"])];
+    let menu_sparse = Menu {
+      headings: &["Profile", "Login", "Region"],
+      ..selector(&sparse)
+    };
+    let mut terminal = vt100::Parser::new(12, 60, 0);
+    render(&mut terminal, &menu_sparse, &[0, 1], 0, Some("Search: "));
+    let rows: Vec<_> = terminal.screen().rows(0, 60).collect();
+    assert_eq!(rows[3], "  Profile  Region");
+    assert_eq!(rows[4], "› dev      eu-north-1");
+
+    let mut terminal = vt100::Parser::new(12, 30, 0);
+    render(&mut terminal, &menu, &[0, 1], 0, Some("Search: "));
+    assert_eq!(
+      terminal.screen().rows(0, 30).nth(4).unwrap(),
+      "› dev        SSO corp  111111"
+    );
+    assert!((0..12).all(|row| !terminal.screen().row_wrapped(row)));
   }
 
   #[test]

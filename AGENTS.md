@@ -18,6 +18,7 @@ awshop is a Rust terminal UI for AWS profiles, with plugins for EKS and SSM. The
 | `src/console.rs` | Signing in to the AWS console as a profile |
 | `src/aws.rs` | AWS config parsing, SSO login checks, executable lookup |
 | `src/config.rs`, `src/preferences.rs` | `config.toml` (read only) and the state file |
+| `src/cache.rs` | Resource lists from earlier runs, shown while a fresh list loads |
 | `src/init.rs`, `src/profiles.rs` | `awshop init`; `awshop add` and `--doctor` |
 | `crates/awshop-plugin` | The plugin contract: `Plugin`, `Context`, `Resource`, `Setup`, `Outcome` |
 | `crates/awshop-eks`, `crates/awshop-ssm` | The built-in plugins |

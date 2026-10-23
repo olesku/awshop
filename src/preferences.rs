@@ -108,34 +108,41 @@ impl Preferences {
       .unwrap_or_default()
   }
 
-  /// Write atomically: a private temporary file, then rename over the old one.
+  /// Write the file atomically and private to the user.
   fn save(&self, path: &Path) -> Result<()> {
-    let parent = path.parent().ok_or("Preferences path has no parent directory.")?;
-    fs::create_dir_all(parent)?;
-
-    let temporary = parent.join(format!(".preferences-{}.tmp", std::process::id()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::OpenOptionsExt;
-      options.mode(0o600);
-    }
-
-    let mut file = options.open(&temporary)?;
-    let result = (|| -> Result<()> {
-      file.write_all(&serde_json::to_vec_pretty(self)?)?;
-      file.write_all(b"\n")?;
-      file.sync_all()?;
-      fs::rename(&temporary, path)?;
-      Ok(())
-    })();
-
-    if result.is_err() {
-      let _ = fs::remove_file(&temporary);
-    }
-    result
+    let mut bytes = serde_json::to_vec_pretty(self)?;
+    bytes.push(b'\n');
+    write_private(path, &bytes)
   }
+}
+
+/// Write atomically: a private temporary file next to `path`, then rename over it.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+  let parent = path.parent().ok_or("State path has no parent directory.")?;
+  let name = path.file_name().ok_or("State path has no file name.")?;
+  fs::create_dir_all(parent)?;
+
+  let temporary = parent.join(format!(".{}-{}.tmp", name.to_string_lossy(), std::process::id()));
+  let mut options = fs::OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+  }
+
+  let mut file = options.open(&temporary)?;
+  let result = (|| -> Result<()> {
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+  })();
+
+  if result.is_err() {
+    let _ = fs::remove_file(&temporary);
+  }
+  result
 }
 
 #[cfg(test)]

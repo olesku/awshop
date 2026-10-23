@@ -71,11 +71,12 @@ elif args[:2] == ['sso', 'login']:
     print('Successfully logged into SSO')
 elif args[:2] == ['eks', 'list-clusters']:
     if (root/'slow-list').exists():
-        time.sleep(5)
+        time.sleep(float((root/'slow-list').read_text() or 5))
     if (root/'fail-list').exists():
         print('AccessDeniedException: eks:ListClusters is not allowed', file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({'clusters':[] if (root/'empty').exists() else ['dev-1', 'tools-1']}))
+    clusters = json.loads((root/'clusters').read_text()) if (root/'clusters').exists() else ['dev-1', 'tools-1']
+    print(json.dumps({'clusters':[] if (root/'empty').exists() else clusters}))
 elif args[:2] == ['eks', 'describe-cluster']:
     if (root/'fail-describe').exists():
         print('AccessDeniedException: eks:DescribeCluster is not allowed', file=sys.stderr)
@@ -137,7 +138,7 @@ class Fixture:
         for name in ('mktemp', 'rm'):
             (self.bin/name).symlink_to(shutil.which(name))
         # Nothing from the developer's environment: only what the tests set.
-        self.env = dict(HOME=str(self.root), XDG_CONFIG_HOME=str(self.root/'config'), XDG_STATE_HOME=str(self.root/'state'),
+        self.env = dict(HOME=str(self.root), XDG_CONFIG_HOME=str(self.root/'config'), XDG_STATE_HOME=str(self.root/'state'), XDG_CACHE_HOME=str(self.root/'cache'),
             TMPDIR=str(self.root/'tmp'), XDG_RUNTIME_DIR=str(self.root/'run'), AWSHOP_TEST_ROOT=str(self.root), AWS_CONFIG_FILE=str(self.config),
             AWS_SHARED_CREDENTIALS_FILE=str(self.root/'credentials'), AWS_PROFILE='dev',
             KUBECONFIG=str(self.root/'kubeconfig'), PATH=str(self.bin), TERM='xterm-256color', LANG='C.UTF-8')
@@ -198,6 +199,8 @@ class Session:
                 return
         self.abort()
         raise AssertionError('Missing '+repr(texts)+'\n'+ANSI.sub(b'', self.latest).decode(errors='replace'))
+    def frame(self):
+        return ANSI.sub(b'', self.output.rsplit(b'\x1b[2J', 1)[-1]).decode(errors='replace')
     def key(self, key, *texts):
         self.latest = b''
         os.write(self.fd, key)
@@ -252,6 +255,17 @@ def test_sso_before_discovery(f):
     operations = [call['args'][:2] for call in f.calls()]
     assert operations[:4] == [['sts', 'get-caller-identity'], ['sso', 'login'], ['sts', 'get-caller-identity'], ['eks', 'list-clusters']]
     assert 'Successfully logged into SSO' in s.output.decode()
+
+
+def test_login_check_gives_the_account(f):
+    f.config.write_text('[profile dev]\nregion=eu-north-1\nsso_session=my-sso\n[sso-session my-sso]\nsso_region=eu-north-1\n')
+    for plugin in ['eks', 'ssm']:
+        s = Session(f, command=[str(BINARY), plugin])
+        s.wait('awshop › '+plugin.upper(), '› ')
+        s.finish(b'\x1b')
+    # One identity lookup each: the login check's answer also gives the plugin the account.
+    operations = [call['args'][:2] for call in f.calls() if call['tool'] == 'aws']
+    assert operations.count(['sts', 'get-caller-identity']) == 2, operations
 
 
 def test_cancel(f):
@@ -416,15 +430,16 @@ def test_shared_profile_selector(f):
 
 def test_cluster_versions_and_status(f):
     s = Session(f)
-    s.wait('dev-1    v1.31', 'tools-1  v1.30 · UPDATING')
+    s.wait('Cluster  Version  Status', 'dev-1    v1.31    ACTIVE', 'tools-1  v1.30    UPDATING')
     s.finish(b'\x1b')
-    # Without eks:DescribeCluster the list still works, without versions.
+    # Without eks:DescribeCluster the list still works, and versions from the last
+    # run don't stay once the fresh list is shown.
     (f.root/'fail-describe').touch()
     s = Session(f)
     s.wait('dev-1', 'tools-1', '^L reload')
-    time.sleep(1)
+    time.sleep(2)
     s.read()
-    assert 'v1.3' not in ANSI.sub(b'', s.output).decode()
+    assert 'v1.3' not in s.frame() and 'Version' not in s.frame() and 'Waiting for AWS' not in s.frame()
     s.finish(b'\x1b')
 
 
@@ -434,7 +449,7 @@ def test_list_shows_before_versions_arrive(f):
     s = Session(f)
     s.wait('dev-1', 'tools-1', '^L reload')
     assert time.monotonic()-started < 2.5 and 'v1.3' not in ANSI.sub(b'', s.output).decode()
-    s.wait('dev-1    v1.31', 'tools-1  v1.30 · UPDATING')
+    s.wait('dev-1    v1.31    ACTIVE', 'tools-1  v1.30    UPDATING')
     s.finish(b'\x1b')
 
 
@@ -449,6 +464,159 @@ def test_current_cluster_is_marked_across_kubeconfig_files(f):
     s.wait('* marks the current one', '  dev-1', '› tools-1 *')
     assert 'dev-1 *' not in ANSI.sub(b'', s.output).decode()
     s.finish(b'\x1b')
+
+
+def remember_list(f, clusters):
+    """Open the list once so it is cached, then make AWS answer slowly with `clusters`."""
+    s = Session(f)
+    s.wait('dev-1', 'tools-1', '^L reload')
+    s.finish(b'\x1b')
+    (f.root/'clusters').write_text(json.dumps(clusters))
+    (f.root/'slow-list').write_text('3')
+
+
+def test_last_list_shows_while_aws_answers(f):
+    remember_list(f, ['dev-1', 'new-1'])
+    cache = f.root/'cache/awshop/eks.json'
+    assert cache.stat().st_mode & 0o777 == 0o600
+    started = time.monotonic()
+    s = Session(f)
+    s.wait('tools-1', 'Last loaded just now · Waiting for AWS…')
+    assert time.monotonic()-started < 2
+    # It is said below the list, so the rows don't move when the fresh list comes.
+    assert s.frame().index('tools-1') < s.frame().index('Last loaded') < s.frame().index('↑/↓')
+    # The fresh list replaces it, with the search typed meanwhile.
+    s.key(b'1', 'Search: 1')
+    s.wait('Search: 1', 'new-1')
+    assert 'tools-1' not in s.frame() and 'Waiting for AWS' not in s.frame()
+    s.finish(b'\x1b')
+    assert 'new-1' in cache.read_text() and 'tools-1' not in cache.read_text()
+
+    # Lists are per profile and region.
+    s = Session(f, ['--region', 'us-east-1'])
+    s.wait('Waiting for AWS…')
+    assert 'new-1' not in s.frame()
+    s.wait('new-1')
+    s.finish(b'\x1b')
+
+
+def test_choice_from_the_last_list_waits_for_aws(f):
+    remember_list(f, ['dev-1'])
+    s = Session(f)
+    s.wait('tools-1', 'Waiting for AWS…')
+    # A cluster that is gone isn't set up; the fresh list shows instead.
+    s.key(b'\x1b[B\r', 'tools-1 is no longer in the list from AWS.')
+    s.key(b'\x1b', '› dev-1')
+    assert 'tools-1' not in s.frame()
+    s.finish(b'\x1b')
+
+    s = Session(f)
+    s.wait('dev-1', 'Waiting for AWS…')
+    s.key(b'\r', 'Configure and activate', 'dev/eu-north-1/dev-1')
+    assert s.finish(b'\r') == ''
+    assert f.updates()[-1][f.updates()[-1].index('--name')+1] == 'dev-1'
+
+
+def test_going_back_after_a_choice_shows_the_fresh_list(f):
+    remember_list(f, ['dev-1'])
+    cache = f.root/'cache/awshop/eks.json'
+    s = Session(f)
+    s.wait('tools-1', 'Waiting for AWS…')
+    s.key(b'\r', 'Configure and activate')
+    # The fresh list is saved at once, since a setup that succeeds doesn't come back.
+    assert 'tools-1' not in cache.read_text()
+    s.key(b'\x1b', '› dev-1', '^L reload')
+    assert 'tools-1' not in s.frame() and 'Waiting for AWS' not in s.frame()
+    s.finish(b'\x1b')
+    lists = [call for call in f.calls() if call['args'][:2] == ['eks', 'list-clusters']]
+    assert len(lists) == 2, lists
+
+
+def test_highlight_is_kept_when_the_fresh_list_comes(f):
+    remember_list(f, ['a-1', 'dev-1', 'tools-1'])
+    s = Session(f)
+    s.wait('Waiting for AWS…')
+    s.key(b'\x1b[B', '› tools-1')
+    # The new cluster comes first, and the highlight stays on the same cluster.
+    s.wait('a-1', '› tools-1')
+    s.finish(b'\x1b')
+
+
+def test_cached_columns_do_not_outlive_a_failing_lookup(f):
+    s = Session(f)
+    s.wait('dev-1    v1.31')
+    s.finish(b'\x1b')
+    (f.root/'fail-describe').touch()
+    s = Session(f)
+    s.wait('Waiting for AWS…', 'v1.31')
+    time.sleep(2)
+    s.read()
+    assert 'Version' not in s.frame()
+    # Even when left with Ctrl-C, the cache keeps what the lookup found.
+    s.finish(b'\x03')
+    assert 'v1.31' not in (f.root/'cache/awshop/eks.json').read_text()
+
+
+def test_empty_last_list_is_not_shown(f):
+    (f.root/'empty').touch()
+    s = Session(f)
+    s.wait('No matching resources')
+    s.finish(b'\x1b')
+    (f.root/'empty').unlink()
+    (f.root/'slow-list').write_text('2')
+    s = Session(f)
+    s.wait('Waiting for AWS…', '^C cancel')
+    assert 'No matching' not in s.frame()
+    s.wait('dev-1', 'tools-1')
+    s.finish(b'\x1b')
+
+
+def test_current_cluster_is_not_taken_from_the_last_list(f):
+    remember_list(f, ['dev-1', 'tools-1'])
+    arn = 'arn:aws:eks:eu-north-1:123456789012:cluster/tools-1'
+    (f.root/'kubeconfig').write_text(json.dumps({'current-context':'tools',
+        'contexts':[{'name':'tools', 'context':{'cluster':arn, 'user':'tools'}}]}))
+    s = Session(f)
+    s.wait('› tools-1 *', 'Waiting for AWS…')
+    s.finish(b'\x1b')
+
+
+def test_failed_refresh_shows_the_error(f):
+    remember_list(f, ['dev-1', 'tools-1'])
+    (f.root/'fail-list').touch()
+    s = Session(f)
+    s.wait('tools-1', 'Waiting for AWS…')
+    s.wait('Could not load resources', 'eks:ListClusters is not allowed')
+    s.finish(b'\x03')
+
+
+def test_expired_login_with_a_last_list(f):
+    f.config.write_text('[profile dev]\nregion=eu-north-1\nsso_session=my-sso\n[sso-session my-sso]\nsso_region=eu-north-1\n')
+    s = Session(f, command=[str(BINARY), 'eks'])
+    s.wait('dev-1', 'tools-1', '^L reload')
+    s.finish(b'\x1b')
+    (f.root/'login-needed').touch()
+    calls = len(f.calls())
+    s = Session(f, command=[str(BINARY), 'eks'])
+    s.wait('tools-1', 'Waiting for AWS…')
+    # The background check never logs in; the login runs as without a cache.
+    s.wait('dev-1', '^L reload')
+    s.finish(b'\x1b')
+    operations = [call['args'][:2] for call in f.calls()[calls:] if call['tool'] == 'aws']
+    assert operations[:5] == [['sts', 'get-caller-identity'], ['sts', 'get-caller-identity'], ['sso', 'login'],
+        ['sts', 'get-caller-identity'], ['eks', 'list-clusters']], operations
+    assert 'Successfully logged into SSO' in s.output.decode()
+
+
+def test_cache_can_be_turned_off(f):
+    f.awshop_config('[eks]\ncache = false\n')
+    remember_list(f, ['dev-1', 'tools-1'])
+    s = Session(f)
+    s.wait('Waiting for AWS…')
+    assert 'dev-1' not in s.frame()
+    s.wait('dev-1', 'tools-1')
+    s.finish(b'\x1b')
+    assert not (f.root/'cache/awshop/eks.json').exists()
 
 
 def test_alias_of_another_profile_is_refused(f):
@@ -491,6 +659,7 @@ def test_ctrl_c_in_an_ssm_session_reaches_only_the_session(f):
     os.write(s.fd, b'exit\n')
     assert s.finish() == ''
     assert 'SSM session on web-1 ended.' in s.output.decode()
+    assert 'web-1' in (f.root/'cache/awshop/ssm.json').read_text()
 
 
 def test_narrow_terminal_drops_the_logo(f):
@@ -588,7 +757,8 @@ def test_recent_profiles_come_first(f):
 
 def test_ssm_lists_managed_instances_and_opens_a_session(f):
     s = Session(f, command=[str(BINARY), 'ssm', '--no-login'])
-    s.wait('awshop › SSM', 'web-1', 'i-0abc · Amazon Linux · 10.0.0.1 · Online', 'i-0def')
+    s.wait('awshop › SSM', 'Name    Instance  Platform      IP address  Agent',
+        'web-1   i-0abc    Amazon Linux  10.0.0.1    Online', 'i-0def  i-0def                              ConnectionLost')
     assert 'mi-0123' not in ANSI.sub(b'', s.output).decode()
     s.key(b'web', '› web-1')
     # Nothing to configure, so Enter on the instance starts the session.
@@ -617,12 +787,13 @@ def test_missing_session_manager_plugin(f):
 def test_page_and_end_keys(f):
     f.config.write_text(''.join(f'[profile p-{index:02}]\nregion=eu-north-1\n' for index in range(40)))
     s = Session(f, command=[str(BINARY), '--no-login'])
-    s.wait('AWS profile selector', '› p-00')
-    # A page is the 14 rows that fit below the logo in this 26-row terminal.
-    s.key(b'\x1b[6~', '› p-14')
-    s.key(b'\x1b[6~', '› p-28')
+    # Columns that no profile has a value for are left out.
+    s.wait('AWS profile selector', 'Profile  Region', '› p-00')
+    # A page is the 13 rows that fit below the logo and headings in this 26-row terminal.
+    s.key(b'\x1b[6~', '› p-13')
+    s.key(b'\x1b[6~', '› p-26')
     s.key(b'\x1b[F', '› p-39')
-    s.key(b'\x1b[5~', '› p-25')
+    s.key(b'\x1b[5~', '› p-26')
     s.key(b'\x1b[H', '› p-00')
     s.key(b'\x1b[5~', '› p-00')
     s.finish(b'\x1b')
