@@ -185,7 +185,7 @@ def test_selector_shows_new_accounts_while_open(f):
     setup(f, portal)
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('AWS profile selector', 'dev *')
-    s.key(b'team', 'No profiles match')
+    s.key(b'/team', 'No profiles match')
     # The sync finishes in the background and the list is rebuilt, with the search kept.
     s.wait('Search: team', 'team-data-production-admin', 'team-data-production-readonly')
     s.finish(b'\x1b')
@@ -336,14 +336,14 @@ def test_selector_details_can_be_chosen(f):
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('Profile  Login     Account       Role   Region', 'dev *    SSO corp  111111111111  Admin  eu-north-1')
     # The search matches the account ID.
-    s.key(b'1111', 'Search: 1111', '› dev')
+    s.key(b'/1111', 'Search: 1111', '› dev')
     s.finish(b'\x1b')
 
     f.awshop_config('[sso]\nsync = false\n\n[selector]\ndetails = ["region", "role"]\n')
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('Profile  Region      Role', 'dev *    eu-north-1  Admin')
     # The account ID is searched even when it isn't shown; other hidden fields aren't.
-    s.key(b'1111', 'Search: 1111', '› dev')
+    s.key(b'/1111', 'Search: 1111', '› dev')
     s.key(b'\x7f'*4+b'corp', 'No profiles match')
     s.finish(b'\x1b')
 

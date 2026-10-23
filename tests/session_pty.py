@@ -389,7 +389,7 @@ def test_selector_opens_a_plugin_for_the_profile(f):
     ''')
     s.wait('AWS profile selector')
     assert '→' not in ANSI.sub(b'', s.latest).decode().splitlines()[-1]
-    s.key(b'prod', '› prod')
+    s.key(b'/prod\x1b', 'Search: prod', '› prod')
     s.key(b'\r', 'awshop › prod', '› Use in this shell', 'EKS', 'SSM')
     s.key(b'\x1b[B'*2, '› EKS')
     s.key(b'\r', '› dev-1', 'AWS profile  prod')

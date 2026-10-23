@@ -364,7 +364,7 @@ def test_profile_and_region(f):
     s = Session(f)
     s.wait('dev-1')
     s.key(b'\x10', 'awshop › AWS profile')
-    s.key(b'prod\r', 'dev-1', 'prod', 'us-east-1')
+    s.key(b'/prod\r', 'dev-1', 'prod', 'us-east-1')
     s.key(b'\x12', 'awshop › AWS region')
     s.key(b'\x1b[B\r', 'Region (for example')
     s.key(b'\x15eu-west-1\r', 'dev-1', 'prod', 'eu-west-1')
@@ -421,7 +421,7 @@ def test_zsh_plugin_dispatch(f):
 def test_shared_profile_selector(f):
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('AWS profile selector', 'dev *')
-    s.key(b'prod', '› prod')
+    s.key(b'/prod', '› prod')
     assert s.finish(b'\r') == 'prod\n'
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('AWS profile selector')
@@ -486,7 +486,7 @@ def test_last_list_shows_while_aws_answers(f):
     # It is said below the list, so the rows don't move when the fresh list comes.
     assert s.frame().index('tools-1') < s.frame().index('Last loaded') < s.frame().index('↑/↓')
     # The fresh list replaces it, with the search typed meanwhile.
-    s.key(b'1', 'Search: 1')
+    s.key(b'/1', 'Search: 1')
     s.wait('Search: 1', 'new-1')
     assert 'tools-1' not in s.frame() and 'Waiting for AWS' not in s.frame()
     s.finish(b'\x1b')
@@ -745,7 +745,7 @@ def test_saved_setup_opens_k9s(f):
 def test_recent_profiles_come_first(f):
     s = Session(f, command=[str(BINARY), '--no-login'])
     s.wait('AWS profile selector', '› dev *')
-    s.key(b'prod', '› prod')
+    s.key(b'/prod', '› prod')
     assert s.finish(b'\r') == 'prod\n'
     assert json.loads(f.preferences().read_text())['recent_profiles'] == ['prod']
     s = Session(f, command=[str(BINARY), '--no-login'])
@@ -760,7 +760,7 @@ def test_ssm_lists_managed_instances_and_opens_a_session(f):
     s.wait('awshop › SSM', 'Name    Instance  Platform      IP address  Agent',
         'web-1   i-0abc    Amazon Linux  10.0.0.1    Online', 'i-0def  i-0def                              ConnectionLost')
     assert 'mi-0123' not in ANSI.sub(b'', s.output).decode()
-    s.key(b'web', '› web-1')
+    s.key(b'/web', '› web-1')
     # Nothing to configure, so Enter on the instance starts the session.
     assert s.finish(b'\r') == ''
     assert 'Start session' not in ANSI.sub(b'', s.output).decode()
@@ -806,7 +806,7 @@ def test_zsh_profile_dispatch(f):
     command = ['/usr/bin/zsh', '-f', '-c', f'source {ROOT}/completions/awshop.zsh; awshop --no-login; print -r -- "PROFILE=$AWS_PROFILE"']
     s = Session(f, command=command)
     s.wait('AWS profile selector')
-    s.key(b'prod', '› prod')
+    s.key(b'/prod', '› prod')
     s.key(b'\r', '› Use in this shell')
     assert s.finish(b'\r') == 'PROFILE=prod\n'
     assert 'Set environment to prod' in s.output.decode()
