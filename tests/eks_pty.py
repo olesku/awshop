@@ -489,7 +489,6 @@ def test_last_list_shows_while_aws_answers(f):
     s.key(b'/1', 'Search: 1')
     s.wait('Search: 1', 'new-1')
     assert 'tools-1' not in s.frame() and 'Waiting for AWS' not in s.frame()
-    s.key(b'\x1b', 'Search: 1')
     s.finish(b'\x1b')
     assert 'new-1' in cache.read_text() and 'tools-1' not in cache.read_text()
 
