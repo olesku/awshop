@@ -311,7 +311,7 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
   let mut selected = menu.selected;
   let mut dirty = true;
   let mut page = 1;
-  let mut search_visible = false;
+  let mut search_visible = !filter.is_empty();
   let mut searching = false;
 
   loop {
