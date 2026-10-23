@@ -311,6 +311,8 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
   let mut selected = menu.selected;
   let mut dirty = true;
   let mut page = 1;
+  let mut search_visible = !filter.is_empty();
+  let mut searching = false;
 
   loop {
     let matches: Vec<_> = items
@@ -326,9 +328,15 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
     for (key, label) in menu.shortcuts {
       help.push_str(&format!(" · ^{} {label}", key.to_ascii_uppercase()));
     }
+    if menu.search.is_some() {
+      help.push_str(if searching {
+        " · esc to exit search"
+      } else {
+        " · / search"
+      });
+    }
     help.push_str(" · ^C exit");
-    let search = menu.search.map(|_| format!("Search: {filter}"));
-
+    let search = search_visible.then(|| format!("Search: {filter}"));
     if dirty {
       page = draw(
         &Menu { items: &items, ..menu },
@@ -373,7 +381,7 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
       }
 
       match key.code {
-        KeyCode::Esc => return Ok(Choice::Back),
+        KeyCode::Esc if !searching => return Ok(Choice::Back),
         KeyCode::Left if !menu.root => return Ok(Choice::Back),
         KeyCode::Enter if menu.opens => {
           if let Some(index) = matches.get(selected) {
@@ -385,17 +393,24 @@ pub fn choose(menu: Menu<'_>) -> io::Result<Choice> {
             return Ok(Choice::Selected(*index));
           }
         }
+        KeyCode::Esc if searching => searching = false,
+        KeyCode::Char('/') if menu.search.is_some() => {
+          search_visible = true;
+          searching = true;
+        }
+        KeyCode::Char('j') if !searching => selected = (selected + 1).min(matches.len().saturating_sub(1)),
+        KeyCode::Char('k') if !searching => selected = selected.saturating_sub(1),
         KeyCode::Up => selected = selected.saturating_sub(1),
         KeyCode::Down => selected = (selected + 1).min(matches.len().saturating_sub(1)),
         KeyCode::PageUp => selected = selected.saturating_sub(page),
         KeyCode::PageDown => selected = (selected + page).min(matches.len().saturating_sub(1)),
         KeyCode::Home => selected = 0,
         KeyCode::End => selected = matches.len().saturating_sub(1),
-        KeyCode::Backspace if menu.search.is_some() => {
+        KeyCode::Backspace if searching => {
           filter.pop();
           selected = 0;
         }
-        KeyCode::Char(character) if menu.search.is_some() && !character.is_control() => {
+        KeyCode::Char(character) if searching && !character.is_control() => {
           filter.push(character);
           selected = 0;
         }
